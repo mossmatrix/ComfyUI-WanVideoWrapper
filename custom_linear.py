@@ -139,7 +139,11 @@ class CustomLinear(nn.Linear):
         self.compute_dtype = compute_dtype
         self.lora_diffs = []
         self.step = 0
-        self.scale_weight = scale_weight
+        # Register scale_weight as buffer for proper device tracking with torch.compile
+        if scale_weight is not None:
+            self.register_buffer('scale_weight', scale_weight, persistent=False)
+        else:
+            self.scale_weight = None
         self.lora_strengths = []
         self.allow_compile = allow_compile
         self.is_gguf = is_gguf
@@ -213,8 +217,8 @@ class CustomLinear(nn.Linear):
                 continue
 
             if isinstance(lora_diff_names, tuple):
-                lora_diff_0 = getattr(self, lora_diff_names[0])
-                lora_diff_1 = getattr(self, lora_diff_names[1])
+                lora_diff_0 = getattr(self, lora_diff_names[0]).to(weight.device)
+                lora_diff_1 = getattr(self, lora_diff_names[1]).to(weight.device)
                 lora_diff_2 = getattr(self, lora_diff_names[2])
 
                 weight = self._apply_lora_impl(
@@ -223,7 +227,7 @@ class CustomLinear(nn.Linear):
                     float(lora_strength)
                 )
             else:
-                lora_diff = getattr(self, lora_diff_names)
+                lora_diff = getattr(self, lora_diff_names).to(weight.device)
                 weight = self._apply_single_lora_impl(weight, lora_diff,float(lora_strength))
         return weight
 
@@ -245,10 +249,11 @@ class CustomLinear(nn.Linear):
 
         # Only apply scale_weight for non-GGUF models
         if not self.is_gguf and self.scale_weight is not None:
+            scale_weight = self.scale_weight.to(input.device)
             if weight.numel() < input.numel():
-                weight = weight * self.scale_weight
+                weight = weight * scale_weight
             else:
-                input = input * self.scale_weight
+                input = input * scale_weight
 
         weight = self._get_weight_with_lora(weight)
         out = self._linear_forward_impl(input, weight, bias)
