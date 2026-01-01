@@ -1,10 +1,7 @@
 import os, gc, math
 import torch
 import torch.nn.functional as F
-import numpy as np
 import hashlib
-
-from .wanvideo.schedulers import get_scheduler, scheduler_list
 
 from .utils import(log, clip_encode_image_tiled, add_noise_to_reference_video, set_module_tensor_to_device)
 from .taehv import TAEHV
@@ -890,6 +887,83 @@ class WanVideoAddMTVMotion:
         updated = dict(embeds)
         updated["mtv_crafter_motion"] = new_entry
         return (updated,)
+
+class WanVideoAddStoryMemLatents:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+                    "vae": ("WANVAE",),
+                    "embeds": ("WANVIDIMAGE_EMBEDS",),
+                    "memory_images": ("IMAGE",),
+                }
+        }
+
+    RETURN_TYPES = ("WANVIDIMAGE_EMBEDS",)
+    RETURN_NAMES = ("image_embeds",)
+    FUNCTION = "add"
+    CATEGORY = "WanVideoWrapper"
+
+    def add(self, vae, embeds, memory_images):
+        updated = dict(embeds)
+        story_mem_latents, = WanVideoEncodeLatentBatch().encode(vae, memory_images)
+        updated["story_mem_latents"] = story_mem_latents["samples"].squeeze(2).permute(1, 0, 2, 3)  # [C, T, H, W]
+        return (updated,)
+
+
+class WanVideoSVIProEmbeds:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+                    "anchor_samples": ("LATENT", {"tooltip": "Initial start image encoded"}),
+                    "num_frames": ("INT", {"default": 81, "min": 1, "max": 10000, "step": 4, "tooltip": "Number of frames to encode"}),
+                },
+                "optional": {
+                    "prev_samples": ("LATENT", {"tooltip": "Last latent from previous generation"}),
+                    "motion_latent_count": ("INT", {"default": 1, "min": 0, "max": 100, "step": 1, "tooltip": "Number of latents used to continue"}),
+                }
+        }
+
+    RETURN_TYPES = ("WANVIDIMAGE_EMBEDS",)
+    RETURN_NAMES = ("image_embeds",)
+    FUNCTION = "add"
+    CATEGORY = "WanVideoWrapper"
+
+    def add(self, anchor_samples, num_frames, prev_samples=None, motion_latent_count=1):
+
+        anchor_latent = anchor_samples["samples"][0].clone()
+
+        C, T, H, W = anchor_latent.shape
+
+        total_latents = (num_frames - 1) // 4 + 1
+        device = anchor_latent.device
+        dtype = anchor_latent.dtype
+
+        if prev_samples is None or motion_latent_count == 0:
+            padding_size = total_latents - anchor_latent.shape[1]
+            padding = torch.zeros(C, padding_size, H, W, dtype=dtype, device=device)
+            y = torch.concat([anchor_latent, padding], dim=1)
+        else:
+            prev_latent = prev_samples["samples"][0].clone()
+            motion_latent = prev_latent[:, -motion_latent_count:]
+            padding_size = total_latents - anchor_latent.shape[1] - motion_latent.shape[1]
+            padding = torch.zeros(C, padding_size, H, W, dtype=dtype, device=device)
+            y = torch.concat([anchor_latent, motion_latent, padding], dim=1)
+
+        msk = torch.ones(1, num_frames, H, W, device=device, dtype=dtype)
+        msk[:, 1:] = 0
+        msk = torch.concat([torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]], dim=1)
+        msk = msk.view(1, msk.shape[1] // 4, 4, H, W)
+        msk = msk.transpose(1, 2)[0]
+
+        image_embeds = {
+            "image_embeds": y,
+            "num_frames": num_frames,
+            "lat_h": H,
+            "lat_w": W,
+            "mask": msk
+        }
+
+        return (image_embeds,)
 
 #region I2V encode
 class WanVideoImageToVideoEncode:
@@ -1829,33 +1903,7 @@ class WanVideoContextOptions:
         }
 
         return (context_options,)
-    
-    
-class WanVideoFlowEdit:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {"required": {
-                "source_embeds": ("WANVIDEOTEXTEMBEDS", ),
-                "skip_steps": ("INT", {"default": 4, "min": 0}),
-                "drift_steps": ("INT", {"default": 0, "min": 0}),
-                "drift_flow_shift": ("FLOAT", {"default": 3.0, "min": 1.0, "max": 30.0, "step": 0.01}),
-                "source_cfg": ("FLOAT", {"default": 6.0, "min": 0.0, "max": 30.0, "step": 0.01}),
-                "drift_cfg": ("FLOAT", {"default": 6.0, "min": 0.0, "max": 30.0, "step": 0.01}),
-            },
-            "optional": {
-                "source_image_embeds": ("WANVIDIMAGE_EMBEDS", ),
-            }
-        }
 
-    RETURN_TYPES = ("FLOWEDITARGS", )
-    RETURN_NAMES = ("flowedit_args",)
-    FUNCTION = "process"
-    CATEGORY = "WanVideoWrapper"
-    DESCRIPTION = "Flowedit options for WanVideo"
-
-    def process(self, **kwargs):
-        return (kwargs,)
-    
 class WanVideoLoopArgs:
     @classmethod
     def INPUT_TYPES(s):
@@ -1927,155 +1975,6 @@ class WanVideoFreeInitArgs:
 
     def process(self, **kwargs):
         return (kwargs,)
-    
-class WanVideoScheduler: #WIP
-    @classmethod
-    def INPUT_TYPES(s):
-        return {"required": {
-                "scheduler": (scheduler_list, {"default": "unipc"}),
-                "steps": ("INT", {"default": 30, "min": 1, "tooltip": "Number of steps for the scheduler"}),
-                "shift": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 1000.0, "step": 0.01}),
-                "start_step": ("INT", {"default": 0, "min": 0, "tooltip": "Starting step for the scheduler"}),
-                "end_step": ("INT", {"default": -1, "min": -1, "tooltip": "Ending step for the scheduler"})
-            },
-            "optional": {
-                "sigmas": ("SIGMAS", ),
-            },
-            "hidden": {
-                "unique_id": "UNIQUE_ID",
-            },
-        }
-
-    RETURN_TYPES = ("SIGMAS", "INT", "FLOAT", scheduler_list, "INT", "INT",)
-    RETURN_NAMES = ("sigmas", "steps", "shift", "scheduler", "start_step", "end_step")
-    FUNCTION = "process"
-    CATEGORY = "WanVideoWrapper"
-    EXPERIMENTAL = True
-
-    def process(self, scheduler, steps, start_step, end_step, shift, unique_id, sigmas=None):
-        sample_scheduler, timesteps, start_idx, end_idx = get_scheduler(
-            scheduler, 
-            steps, 
-            start_step, end_step, shift, 
-            device, 
-            sigmas=sigmas,
-            log_timesteps=True)
-        
-        scheduler_dict = {
-            "sample_scheduler": sample_scheduler,
-            "timesteps": timesteps,
-        }
-
-        try:
-            from server import PromptServer
-            import io
-            import base64
-            import matplotlib.pyplot as plt
-        except:
-            PromptServer = None
-        if unique_id and PromptServer is not None:
-            try:
-                # Plot sigmas and save to a buffer
-                sigmas_np = sample_scheduler.full_sigmas.cpu().numpy()
-                if not np.isclose(sigmas_np[-1], 0.0, atol=1e-6):
-                    sigmas_np = np.append(sigmas_np, 0.0)
-                buf = io.BytesIO()
-                fig = plt.figure(facecolor='#353535')
-                ax = fig.add_subplot(111)
-                ax.set_facecolor('#353535')  # Set axes background color
-                x_values = range(0, len(sigmas_np))
-                ax.plot(x_values, sigmas_np)
-                # Annotate each sigma value
-                ax.scatter(x_values, sigmas_np, color='white', s=20, zorder=3)  # Small dots at each sigma
-                for x, y in zip(x_values, sigmas_np):
-                    # Show all annotations if few steps, or just show split step annotations
-                    show_annotation = len(sigmas_np) <= 10
-                    is_split_step = (start_idx > 0 and x == start_idx) or (end_idx != -1 and x == end_idx + 1)
-                    
-                    if show_annotation or is_split_step:
-                        color = 'orange'
-                        if is_split_step:
-                            color = 'yellow'
-                        ax.annotate(f"{y:.3f}", (x, y), textcoords="offset points", xytext=(10, 1), ha='center', color=color, fontsize=12)
-                ax.set_xticks(x_values)
-                ax.set_title("Sigmas", color='white')           # Title font color
-                ax.set_xlabel("Step", color='white')            # X label font color
-                ax.set_ylabel("Sigma Value", color='white')     # Y label font color
-                ax.tick_params(axis='x', colors='white', labelsize=10)        # X tick color
-                ax.tick_params(axis='y', colors='white', labelsize=10)        # Y tick color
-                # Add split point if end_step is defined
-                end_idx += 1
-                if end_idx != -1 and 0 <= end_idx < len(sigmas_np) - 1:
-                    ax.axvline(end_idx, color='red', linestyle='--', linewidth=2, label='end_step split')
-                # Add split point if start_step is defined
-                if start_idx > 0 and 0 <= start_idx < len(sigmas_np):
-                    ax.axvline(start_idx, color='green', linestyle='--', linewidth=2, label='start_step split')
-                if (end_idx != -1 and 0 <= end_idx < len(sigmas_np)) or (start_idx > 0 and 0 <= start_idx < len(sigmas_np)):
-                    handles, labels = ax.get_legend_handles_labels()
-                    if labels:
-                        ax.legend()
-                if start_idx < end_idx and 0 <= start_idx < len(sigmas_np) and 0 < end_idx < len(sigmas_np):
-                    ax.axvspan(start_idx, end_idx, color='lightblue', alpha=0.1, label='Sampled Range')
-                plt.tight_layout()
-                plt.savefig(buf, format='png')
-                plt.close(fig)
-                buf.seek(0)
-                img_base64 = base64.b64encode(buf.read()).decode('utf-8')
-                buf.close()
-
-                # Send as HTML img tag with base64 data
-                html_img = f"<img src='data:image/png;base64,{img_base64}' alt='Sigmas Plot' style='max-width:100%; height:100%; overflow:hidden; display:block;'>"
-                PromptServer.instance.send_progress_text(html_img, unique_id)
-            except Exception as e:
-                print("Failed to send sigmas plot:", e)
-                pass
-
-        return (sigmas, steps, shift, scheduler_dict, start_step, end_step)
-    
-class WanVideoSchedulerSA_ODE:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {"required": {
-                "use_adaptive_order": ("BOOLEAN", {"default": False, "tooltip": "Use adaptive order"}),
-                "use_velocity_smoothing": ("BOOLEAN", {"default": True, "tooltip": "Use velocity smoothing"}),
-                "convergence_threshold": ("FLOAT", {"default": 0.15, "min": 0.0, "max": 1.0, "step": 0.001, "tooltip": "Convergence threshold for velocity smoothing"}),
-                "smoothing_factor": ("FLOAT", {"default": 0.8, "min": 0.0, "max": 1.0, "step": 0.001, "tooltip": "Smoothing factor for velocity smoothing"}),
-                "steps": ("INT", {"default": 30, "min": 1, "tooltip": "Number of steps for the scheduler"}),
-                "shift": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 1000.0, "step": 0.01}),
-                "start_step": ("INT", {"default": 0, "min": 0, "tooltip": "Starting step for the scheduler"}),
-                "end_step": ("INT", {"default": -1, "min": -1, "tooltip": "Ending step for the scheduler"})
-            },
-            "optional": {
-                "sigmas": ("SIGMAS", ),
-            },
-        }
-
-    RETURN_TYPES = ("SIGMAS", "INT", "FLOAT", scheduler_list, "INT", "INT",)
-    RETURN_NAMES = ("sigmas", "steps", "shift", "scheduler", "start_step", "end_step")
-    FUNCTION = "process"
-    CATEGORY = "WanVideoWrapper"
-    EXPERIMENTAL = True
-
-    def process(self, steps, start_step, end_step, shift, use_adaptive_order, use_velocity_smoothing, convergence_threshold, smoothing_factor, sigmas=None):
-        sample_scheduler, timesteps, _, _ = get_scheduler(
-            scheduler="sa_ode_stable/lowstep", 
-            steps=steps, 
-            start_step=start_step, end_step=end_step, shift=shift, 
-            device=device, 
-            sigmas=sigmas,
-            log_timesteps=True,
-            use_adaptive_order=use_adaptive_order,
-            use_velocity_smoothing=use_velocity_smoothing,
-            convergence_threshold=convergence_threshold,
-            smoothing_factor=smoothing_factor
-            )
-        
-        scheduler_dict = {
-            "sample_scheduler": sample_scheduler,
-            "timesteps": timesteps,
-        }
-
-        return (sigmas, steps, shift, scheduler_dict, start_step, end_step)
 
 rope_functions = ["default", "comfy", "comfy_chunked"]
 class WanVideoRoPEFunction:
@@ -2198,7 +2097,7 @@ class WanVideoDecode:
             video.clamp_(-1.0, 1.0)
             video.add_(1.0).div_(2.0)
             return video.cpu().float(),
-        latents = samples["samples"]
+        latents = samples["samples"].clone()
         end_image = samples.get("end_image", None)
         has_ref = samples.get("has_ref", False)
         drop_last = samples.get("drop_last", False)
@@ -2274,7 +2173,7 @@ class WanVideoEncodeLatentBatch:
     CATEGORY = "WanVideoWrapper"
     DESCRIPTION = "Encodes a batch of images individually to create a latent video batch where each video is a single frame, useful for I2V init purposes, for example as multiple context window inits"
 
-    def encode(self, vae, images, enable_vae_tiling, tile_x, tile_y, tile_stride_x, tile_stride_y, latent_strength=1.0):
+    def encode(self, vae, images, enable_vae_tiling=False, tile_x=272, tile_y=272, tile_stride_x=144, tile_stride_y=128, latent_strength=1.0):
         vae.to(device)
 
         images = images.clone()
@@ -2380,7 +2279,6 @@ NODE_CLASS_MAPPINGS = {
     "WanVideoEnhanceAVideo": WanVideoEnhanceAVideo,
     "WanVideoContextOptions": WanVideoContextOptions,
     "WanVideoTextEmbedBridge": WanVideoTextEmbedBridge,
-    "WanVideoFlowEdit": WanVideoFlowEdit,
     "WanVideoControlEmbeds": WanVideoControlEmbeds,
     "WanVideoSLG": WanVideoSLG,
     "WanVideoLoopArgs": WanVideoLoopArgs,
@@ -2396,7 +2294,6 @@ NODE_CLASS_MAPPINGS = {
     "WanVideoBlockList": WanVideoBlockList,
     "WanVideoTextEncodeCached": WanVideoTextEncodeCached,
     "WanVideoAddExtraLatent": WanVideoAddExtraLatent,
-    "WanVideoScheduler": WanVideoScheduler,
     "WanVideoAddStandInLatent": WanVideoAddStandInLatent,
     "WanVideoAddControlEmbeds": WanVideoAddControlEmbeds,
     "WanVideoAddMTVMotion": WanVideoAddMTVMotion,
@@ -2404,11 +2301,12 @@ NODE_CLASS_MAPPINGS = {
     "WanVideoAddPusaNoise": WanVideoAddPusaNoise,
     "WanVideoAnimateEmbeds": WanVideoAnimateEmbeds,
     "WanVideoAddLucyEditLatents": WanVideoAddLucyEditLatents,
-    "WanVideoSchedulerSA_ODE": WanVideoSchedulerSA_ODE,
     "WanVideoAddBindweaveEmbeds": WanVideoAddBindweaveEmbeds,
     "TextImageEncodeQwenVL": TextImageEncodeQwenVL,
     "WanVideoUniLumosEmbeds": WanVideoUniLumosEmbeds,
     "WanVideoAddTTMLatents": WanVideoAddTTMLatents,
+    "WanVideoAddStoryMemLatents": WanVideoAddStoryMemLatents,
+    "WanVideoSVIProEmbeds": WanVideoSVIProEmbeds,
     }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -2424,7 +2322,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoEnhanceAVideo": "WanVideo Enhance-A-Video",
     "WanVideoContextOptions": "WanVideo Context Options",
     "WanVideoTextEmbedBridge": "WanVideo TextEmbed Bridge",
-    "WanVideoFlowEdit": "WanVideo FlowEdit",
     "WanVideoControlEmbeds": "WanVideo Control Embeds",
     "WanVideoSLG": "WanVideo SLG",
     "WanVideoLoopArgs": "WanVideo Loop Args",
@@ -2447,8 +2344,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoAddPusaNoise": "WanVideo Add Pusa Noise",
     "WanVideoAnimateEmbeds": "WanVideo Animate Embeds",
     "WanVideoAddLucyEditLatents": "WanVideo Add LucyEdit Latents",
-    "WanVideoSchedulerSA_ODE": "WanVideo Scheduler SA-ODE",
     "WanVideoAddBindweaveEmbeds": "WanVideo Add Bindweave Embeds",
     "WanVideoUniLumosEmbeds": "WanVideo UniLumos Embeds",
     "WanVideoAddTTMLatents": "WanVideo Add TTMLatents",
+    "WanVideoAddStoryMemLatents": "WanVideo Add StoryMem Latents",
+    "WanVideoSVIProEmbeds": "WanVideo SVIPro Embeds",
 }
